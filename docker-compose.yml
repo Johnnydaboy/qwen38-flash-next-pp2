@@ -1,0 +1,69 @@
+name: qwen38-flash-next-pp2
+
+services:
+  qwen38-flash-next-pp2:
+    image: qwen38-flash-next:pp2
+    container_name: qwen38-flash-next-api
+    hostname: qwen38-flash-next-api
+    ipc: host
+    shm_size: '96gb'
+    # Keep enough RAM outside the model cgroup for the guest OS, Docker,
+    # llama-swap, and SSH. Setting memory_swap equal to memory disables swap
+    # for this container, preventing a model OOM from stalling the whole VM.
+    mem_limit: 110g
+    memswap_limit: 110g
+    cap_add:
+      - SYS_PTRACE
+    ports:
+      - "8001:8000"
+    environment:
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+      - VLLM_BT_POOL=1
+      - CUDA_DEVICE_ORDER=PCI_BUS_ID
+      - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-${HF_TOKEN:-}}
+      - HF_TOKEN=${HF_TOKEN:-}
+      - VLLM_PLE_CPU_OFFLOAD=1
+      - VLLM_GDN_DECODE_KERNEL=triton
+    volumes:
+      - /home/jonathan/.cache/huggingface:/root/.cache/huggingface
+      - vllm-cache:/root/.cache/vllm
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    command: >
+      serve cyankiwi/Qwen3.8-Flash-Next-AWQ-INT4
+      --served-model-name qwen38-flash-next-awq
+      --max-model-len auto
+      --pipeline-parallel-size 2
+      --gpu-memory-utilization 0.9
+      --max-num-seqs 1
+      --mamba-cache-mode align
+      --mamba-ssm-cache-dtype float32
+      --reasoning-parser qwen3
+      --tool-call-parser qwen3_coder
+      --enable-auto-tool-choice
+      --trust-remote-code
+      --generation-config auto
+      --default-chat-template-kwargs '{"enable_thinking":true,"preserve_thinking":true,"reasoning_effort":"medium"}'
+      --override-generation-config '{"temperature":0.6,"top_p":0.95,"top_k":20,"min_p":0.0,"repetition_penalty":1.05,"presence_penalty":0.1}'
+    # llama-swap owns this model's lifecycle. Do not enter an OOM restart loop.
+    restart: "no"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 360s
+    networks:
+      - ai-net
+
+volumes:
+  vllm-cache:
+
+networks:
+  ai-net:
+    external: true

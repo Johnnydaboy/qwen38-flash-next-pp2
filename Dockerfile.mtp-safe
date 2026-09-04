@@ -1,0 +1,2 @@
+FROM qwen38-flash-next:pp2
+COPY pp_utils.py /opt/vllm/vllm/v1/worker/gpu/pp_utils.py

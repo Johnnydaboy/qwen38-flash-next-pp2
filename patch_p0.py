@@ -169,6 +169,50 @@ def patch_block_table(root="/opt/vllm"):
                 print(repr(t[t.find("if out is None:"):t.find("if out is None:")+500]))
         else:
             print("WARNING block_table rotate not found")
+
+    # PP projection preserves global KV-cache group indices. Groups with no
+    # layers on this worker are represented by zero-width block tables and
+    # slot_mapping_enabled=False. tl.where does not predicate the later load,
+    # so the stock kernel dereferences the null table pointer on that group.
+    old4 = """        block_numbers = tl.load(
+            block_table_ptr + req_state_idx * block_table_stride + block_indices,
+            mask=is_local,
+            other=0,
+        )"""
+    new4 = """        block_numbers = tl.load(
+            block_table_ptr + req_state_idx * block_table_stride + block_indices,
+            # PP: disabled/empty groups have a zero-width (null) block table.
+            # Predicate the load itself; tl.where above does not prevent it.
+            mask=(offset < end_idx) & is_local & mapping_enabled,
+            other=0,
+        )"""
+    if old4 in t:
+        t = t.replace(old4, new4)
+        print("patched block_table disabled-group slot-mapping load")
+    elif "mask=(offset < end_idx) & is_local & mapping_enabled" in t:
+        print("block_table disabled-group load already patched")
+    else:
+        print("WARNING block_table slot-mapping load pattern not found")
+
+    # The scheduler sends block IDs for every global KV-cache group to every
+    # PP worker. A projected group with no layers on this stage deliberately
+    # has a zero-width table. Do not stage global IDs into that absent table.
+    old5 = """            row_capacity = self.block_tables[i].gpu.shape[1]
+            if end > row_capacity:
+                raise RuntimeError("""
+    new5 = """            row_capacity = self.block_tables[i].gpu.shape[1]
+            if row_capacity == 0:
+                self.num_blocks.np[i, req_index] = 0
+                continue
+            if end > row_capacity:
+                raise RuntimeError("""
+    if old5 in t:
+        t = t.replace(old5, new5)
+        print("patched block_table zero-capacity PP group append")
+    elif "if row_capacity == 0:" in t:
+        print("block_table zero-capacity group append already patched")
+    else:
+        print("WARNING block_table zero-capacity append pattern not found")
     p.write_text(t)
 
 def patch_single_type(root="/opt/vllm"):
@@ -462,6 +506,302 @@ def patch_connector(root="/opt/vllm"):
             print("already has handshake")
     p.write_text(t)
 
+def patch_pp_warmup_broadcast(root="/opt/vllm"):
+    p = pathlib.Path(root) / "vllm/v1/worker/gpu/pp_utils.py"
+    t = p.read_text()
+
+    # Dedicated subgroup for the sampled-token broadcast with eager init
+    sibling_old = """        self.broadcast_group = get_pp_group().make_sibling_device_group(
+            group_desc="pp_broadcast"
+        )"""
+    sibling_new = """        self.broadcast_group = get_pp_group().make_sibling_device_group(
+            group_desc="pp_broadcast"
+        )
+        self.warmup_sync = False
+        # Initialize this NCCL communicator before request-time activation P2P
+        # can initialize a different communicator concurrently on another
+        # stream. Concurrent lazy NCCL initialization deadlocks on PP=2.
+        comm_init = torch.zeros(1, dtype=torch.int32, device=self.device)
+        torch.distributed.broadcast(
+            comm_init, src=self.last_rank, group=self.broadcast_group
+        )
+        self.main_stream.synchronize()"""
+    if sibling_old in t:
+        t = t.replace(sibling_old, sibling_new, 1)
+        print("patched PP sampled-token communicator eager init")
+    elif "Concurrent lazy NCCL initialization deadlocks" in t:
+        print("PP communicator eager init already patched")
+    else:
+        print("WARNING PP communicator eager-init pattern not found")
+
+    # Replace receive method to be rank-invariant and synchronize event
+    old_recv_full = """    def receive(self, input_batch: InputBatch) -> bool:
+        \"\"\"Returns True iff sampled tokens need to be gathered from *all*
+        requests in the batch.\"\"\"
+        assert not self.is_last_rank
+        need_sampled_mask = compute_need_sampled_mask(input_batch)
+        if need_sampled_mask is None:
+            # Leave this step's reserved slot as None.
+            return False
+
+        # Snapshot the per-slot generation counter so a later free of any of
+        # these RequestStates request indices is detectable at consume time.
+        gen_at_receive_np = self.req_idx_gen_np[input_batch.idx_mapping_np]
+
+        num_reqs = input_batch.num_reqs
+        with torch.cuda.stream(self.broadcast_stream):
+            self.broadcast_stream.wait_stream(self.main_stream)
+            sampled_tokens = torch.empty(
+                num_reqs, self.max_sample_len, dtype=torch.int64, device=self.device
+            )
+            combined = torch.empty(2, num_reqs, dtype=torch.int32, device=self.device)
+            torch.distributed.broadcast(
+                sampled_tokens, src=self.last_rank, group=self.broadcast_group
+            )
+            torch.distributed.broadcast(
+                combined, src=self.last_rank, group=self.broadcast_group
+            )
+            event = self.broadcast_stream.record_event()
+            num_sampled, num_rejected = combined.unbind(dim=0)
+            # Must record_stream since these were allocated on broadcast stream but
+            # later used on the main stream.
+            sampled_tokens.record_stream(self.main_stream)
+            combined.record_stream(self.main_stream)
+        self.queue[-1] = PendingRecv(
+            event,
+            sampled_tokens,
+            num_sampled,
+            num_rejected,
+            input_batch.idx_mapping,
+            input_batch.idx_mapping_np,
+            need_sampled_mask,
+            gen_at_receive_np,
+        )
+        return bool(need_sampled_mask.all())"""
+
+    new_recv_full = """    def receive(self, input_batch: InputBatch) -> bool:
+        \"\"\"Returns True iff sampled tokens need to be gathered from *all*
+        requests in the batch.\"\"\"
+        assert not self.is_last_rank
+        need_sampled_mask = compute_need_sampled_mask(input_batch)
+        if need_sampled_mask is None:
+            need_sampled_mask = np.full(
+                input_batch.num_reqs, self.warmup_sync, dtype=np.bool_
+            )
+
+        # Snapshot the per-slot generation counter so a later free of any of
+        # these RequestStates request indices is detectable at consume time.
+        gen_at_receive_np = self.req_idx_gen_np[input_batch.idx_mapping_np]
+
+        num_reqs = input_batch.num_reqs
+        with torch.cuda.stream(self.broadcast_stream):
+            self.broadcast_stream.wait_stream(self.main_stream)
+            sampled_tokens = torch.empty(
+                num_reqs, self.max_sample_len, dtype=torch.int64, device=self.device
+            )
+            combined = torch.empty(2, num_reqs, dtype=torch.int32, device=self.device)
+            torch.distributed.broadcast(
+                sampled_tokens, src=self.last_rank, group=self.broadcast_group
+            )
+            torch.distributed.broadcast(
+                combined, src=self.last_rank, group=self.broadcast_group
+            )
+            event = self.broadcast_stream.record_event()
+            num_sampled, num_rejected = combined.unbind(dim=0)
+            # Must record_stream since these were allocated on broadcast stream but
+            # later used on the main stream.
+            sampled_tokens.record_stream(self.main_stream)
+            combined.record_stream(self.main_stream)
+        # Do not overlap the sampled-token collective with the next PP P2P.
+        event.synchronize()
+        self.queue[-1] = PendingRecv(
+            event,
+            sampled_tokens,
+            num_sampled,
+            num_rejected,
+            input_batch.idx_mapping,
+            input_batch.idx_mapping_np,
+            need_sampled_mask,
+            gen_at_receive_np,
+        )
+        return bool(need_sampled_mask.all())"""
+
+    if old_recv_full in t:
+        t = t.replace(old_recv_full, new_recv_full, 1)
+        print("patched PP receive method")
+    else:
+        print("WARNING PP old_recv_full pattern not found; trying fallback")
+
+    # Replace broadcast method to pad to max_sample_len
+    old_broadcast_full = """    def broadcast(
+        self,
+        sampled_token_ids: torch.Tensor,
+        num_sampled: torch.Tensor,
+        num_rejected: torch.Tensor,
+        input_batch: InputBatch,
+    ) -> None:
+        assert self.is_last_rank
+        if compute_need_sampled_mask(input_batch) is None:
+            # No request needs sampled outputs for a subsequent decode step.
+            return
+
+        assert sampled_token_ids.dtype == torch.int64
+
+        if current_platform.is_xpu():
+            self.main_stream.synchronize()
+
+        with torch.cuda.stream(self.broadcast_stream):
+            self.broadcast_stream.wait_stream(self.main_stream)
+            torch.distributed.broadcast(
+                sampled_token_ids.contiguous(),
+                src=self.last_rank,
+                group=self.broadcast_group,
+            )
+            combined = torch.stack((num_sampled, num_rejected), dim=0)
+            torch.distributed.broadcast(
+                combined, src=self.last_rank, group=self.broadcast_group
+            )
+            for tensor in (sampled_token_ids, num_sampled, num_rejected):
+                tensor.record_stream(self.broadcast_stream)"""
+
+    new_broadcast_full = """    def broadcast(
+        self,
+        sampled_token_ids: torch.Tensor,
+        num_sampled: torch.Tensor,
+        num_rejected: torch.Tensor,
+        input_batch: InputBatch,
+    ) -> None:
+        assert self.is_last_rank
+        # Always match the non-last rank's collectives. Whether these outputs
+        # are retained is a receiver-local policy represented by its mask.
+        assert sampled_token_ids.dtype == torch.int64
+
+        num_reqs = input_batch.num_reqs
+        if sampled_token_ids.shape[1] < self.max_sample_len:
+            padded = torch.zeros(
+                (num_reqs, self.max_sample_len),
+                dtype=torch.int64,
+                device=self.device,
+            )
+            padded[:, : sampled_token_ids.shape[1]] = sampled_token_ids
+            to_broadcast = padded
+        else:
+            to_broadcast = sampled_token_ids.contiguous()
+
+        if current_platform.is_xpu():
+            self.main_stream.synchronize()
+
+        with torch.cuda.stream(self.broadcast_stream):
+            self.broadcast_stream.wait_stream(self.main_stream)
+            torch.distributed.broadcast(
+                to_broadcast,
+                src=self.last_rank,
+                group=self.broadcast_group,
+            )
+            combined = torch.stack((num_sampled, num_rejected), dim=0)
+            torch.distributed.broadcast(
+                combined, src=self.last_rank, group=self.broadcast_group
+            )
+            for tensor in (to_broadcast, num_sampled, num_rejected):
+                tensor.record_stream(self.broadcast_stream)
+        # Match the receiver before either rank advances to the next P2P.
+        self.broadcast_stream.synchronize()"""
+
+    if old_broadcast_full in t:
+        t = t.replace(old_broadcast_full, new_broadcast_full, 1)
+        print("patched PP broadcast method")
+    else:
+        print("WARNING PP old_broadcast_full pattern not found")
+
+    p.write_text(t)
+
+def patch_warmup_pp_mode(root="/opt/vllm"):
+    p = pathlib.Path(root) / "vllm/v1/worker/gpu/warmup.py"
+    t = p.read_text()
+    old = """    # Disable KV connector for warmup run.
+    model_runner.kv_connector.set_disabled(True)
+    worker_execute_model(prefill_output)"""
+    new = """    # Disable KV connector for warmup run.
+    model_runner.kv_connector.set_disabled(True)
+    # PP stage-local synthetic metadata can disagree about whether sampling is
+    # needed. Force matched, synchronous side-stream collectives for warmup.
+    if model_runner.pp_handler is not None:
+        model_runner.pp_handler.warmup_sync = True
+    worker_execute_model(prefill_output)"""
+    if old in t:
+        t = t.replace(old, new, 1)
+        print("patched warmup PP mode enable")
+    old_end = """    model_runner.kv_connector.set_disabled(False)
+    torch.accelerator.synchronize()"""
+    new_end = """    model_runner.kv_connector.set_disabled(False)
+    if model_runner.pp_handler is not None:
+        model_runner.pp_handler.warmup_sync = False
+    torch.accelerator.synchronize()"""
+    if old_end in t:
+        t = t.replace(old_end, new_end, 1)
+        print("patched warmup PP mode disable")
+    p.write_text(t)
+
+def patch_skip_v2_pp_synthetic_warmup(root="/opt/vllm"):
+    p = pathlib.Path(root) / "vllm/v1/worker/gpu_worker.py"
+    t = p.read_text()
+    old = """        if self.use_v2_model_runner:
+            # V2: Run full execute_model + sample_tokens to JIT compile triton kernels.
+            warmup_kernels(self.model_runner, self.execute_model, self.sample_tokens)
+        elif get_pp_group().is_last_rank:"""
+    new = """        if self.use_v2_model_runner:
+            # The synthetic V2 warmup constructs stage-local request metadata.
+            # Under PP this can make the sampled-token side collective diverge
+            # from the next activation P2P ordering and deadlock initialization.
+            # CUDA graphs/model compilation are already complete; defer these
+            # small sampler/state kernels to the first real scheduled request.
+            if self.parallel_config.pipeline_parallel_size > 1:
+                logger.warning(
+                    "Skipping V2 synthetic kernel warmup under pipeline "
+                    "parallelism; kernels will JIT on the first request."
+                )
+            else:
+                warmup_kernels(
+                    self.model_runner, self.execute_model, self.sample_tokens
+                )
+        elif get_pp_group().is_last_rank:"""
+    if old in t:
+        t = t.replace(old, new, 1)
+        print("patched skip V2 PP synthetic warmup")
+    else:
+        print("WARNING V2 PP synthetic warmup pattern not found")
+    p.write_text(t)
+
+def patch_model_runner(root="/opt/vllm"):
+    p = pathlib.Path(root) / "vllm/v1/worker/gpu/model_runner.py"
+    t = p.read_text()
+    old = """            self.model_state.preprocess_state(
+                input_batch,
+                block_tables,
+                self.kv_cache_config,
+                self.req_states.num_computed_tokens.gpu,
+            )"""
+    new = """            # FIX (ours): give the mamba spec-decode ctx the SOURCE
+            # per-request-slot block tables (stable data_ptr, req-indexed,
+            # stream-ordered staged writes) instead of the per-step gathered
+            # views; the ctx captures raw pointers once, and gathered views
+            # rotate/mutate under PP. Kernels index rows by req_idx to match
+            # (mamba_utils.py).
+            self.model_state.preprocess_state(
+                input_batch,
+                tuple(bt.gpu for bt in self.block_tables.block_tables),
+                self.kv_cache_config,
+                self.req_states.num_computed_tokens.gpu,
+            )"""
+    if old in t:
+        t = t.replace(old, new, 1)
+        print("patched model_runner master block_tables for preprocess_state")
+        p.write_text(t)
+    elif "tuple(bt.gpu for bt in self.block_tables.block_tables)" in t:
+        print("model_runner already has master block_tables fix")
+    else:
+        print("WARNING model_runner preprocess_state pattern not found")
+
 if __name__ == "__main__":
     root = sys.argv[1] if len(sys.argv) > 1 else "/opt/vllm"
     patch_mamba_utils(root)
@@ -470,4 +810,9 @@ if __name__ == "__main__":
     patch_mamba_hybrid(root)
     patch_ple_layer(root)
     patch_connector(root)
+    patch_pp_warmup_broadcast(root)
+    patch_warmup_pp_mode(root)
+    patch_skip_v2_pp_synthetic_warmup(root)
+    patch_model_runner(root)
     print("all P0+ done")
+
